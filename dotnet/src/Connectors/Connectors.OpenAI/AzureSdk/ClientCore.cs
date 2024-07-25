@@ -464,6 +464,10 @@ internal abstract class ClientCore
 
             // We must send back a response for every tool call, regardless of whether we successfully executed it or not.
             // If we successfully execute it, we'll add the result. If we don't, we'll add an error.
+            bool concurrentInvocation = true; // TODO: Make configurable via FunctionChoiceBehavior.
+            var functionTasks = concurrentInvocation && result.ToolCalls.Count > 1 ?
+                new List<Task<(string? Result, string? ErrorMessage, ChatCompletionsToolCall ToolCall, bool Terminate)>>(result.ToolCalls.Count) :
+                null;
             for (int toolCallIndex = 0; toolCallIndex < result.ToolCalls.Count; toolCallIndex++)
             {
                 ChatCompletionsToolCall toolCall = result.ToolCalls[toolCallIndex];
@@ -505,8 +509,7 @@ internal abstract class ClientCore
                 }
 
                 // Now, invoke the function, and add the resulting tool call message to the chat options.
-                FunctionResult functionResult = new(function) { Culture = kernel.Culture };
-                AutoFunctionInvocationContext invocationContext = new(kernel, function, functionResult, chat, result)
+                AutoFunctionInvocationContext invocationContext = new(kernel, function, new(function) { Culture = kernel.Culture }, chat, result)
                 {
                     ToolCallId = toolCall.Id,
                     Arguments = functionArgs,
@@ -516,52 +519,69 @@ internal abstract class ClientCore
                     CancellationToken = cancellationToken
                 };
 
-                s_inflightAutoInvokes.Value++;
-                try
+                var functionTask = Task.Run<(string? Result, string? ErrorMessage, ChatCompletionsToolCall ToolCall, bool Terminate)>(async () =>
                 {
-                    invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
+                    s_inflightAutoInvokes.Value++; // doesn't need to be decremented explicitly, it'll be reverted as part of the Task unwinding ExecutionContext
+                    try
                     {
-                        // Check if filter requested termination.
-                        if (context.Terminate)
+                        invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
                         {
-                            return;
-                        }
+                            // Check if filter requested termination.
+                            if (context.Terminate)
+                            {
+                                return;
+                            }
 
-                        // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
-                        // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
-                        // as the called function could in turn telling the model about itself as a possible candidate for invocation.
-                        context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    }).ConfigureAwait(false);
-                }
+                            // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
+                            // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
+                            // as the called function could in turn telling the model about itself as a possible candidate for invocation.
+                            context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }).ConfigureAwait(false);
+                    }
 #pragma warning disable CA1031 // Do not catch general exception types
-                catch (Exception e)
-#pragma warning restore CA1031 // Do not catch general exception types
-                {
-                    AddResponseMessage(chatOptions, chat, null, $"Error: Exception while invoking function. {e.Message}", toolCall, this.Logger);
-                    continue;
-                }
-                finally
-                {
-                    s_inflightAutoInvokes.Value--;
-                }
-
-                // Apply any changes from the auto function invocation filters context to final result.
-                functionResult = invocationContext.Result;
-
-                object functionResultValue = functionResult.GetValue<object>() ?? string.Empty;
-                var stringResult = ProcessFunctionResult(functionResultValue, chatExecutionSettings.ToolCallBehavior);
-
-                AddResponseMessage(chatOptions, chat, stringResult, errorMessage: null, functionToolCall, this.Logger);
-
-                // If filter requested termination, returning latest function result.
-                if (invocationContext.Terminate)
-                {
-                    if (this.Logger.IsEnabled(LogLevel.Debug))
+                    catch (Exception e)
+#pragma warning restore CA1031
                     {
-                        this.Logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return (null, $"Error: Exception while invoking function. {e.Message}", toolCall, false);
                     }
 
-                    return [chat.Last()];
+                    // Apply any changes from the auto function invocation filters context to final result.
+                    var stringResult = ProcessFunctionResult(invocationContext.Result.GetValue<object>() ?? string.Empty, chatExecutionSettings.ToolCallBehavior);
+
+                    return (stringResult, null, functionToolCall, invocationContext.Terminate);
+                }, cancellationToken);
+
+                // If concurrent invocation is enabled, add the task to the list for later waiting. Otherwise, join with it now.
+                if (functionTasks is not null)
+                {
+                    functionTasks.Add(functionTask);
+                }
+                else
+                {
+                    var functionResult = await functionTask.ConfigureAwait(false);
+                    AddResponseMessage(chatOptions, chat, functionResult.Result, functionResult.ErrorMessage, functionResult.ToolCall, this.Logger);
+                    if (functionResult.Terminate)
+                    {
+                        this.Logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return [chat.Last()];
+                    }
+                }
+            }
+
+            // If concurrent invocation is enabled, join with all the tasks now.
+            if (functionTasks is not null)
+            {
+                // Wait for all of the function invocations to complete, then add the results to the chat, but stop when we hit a
+                // function for which termination was requested.
+                await Task.WhenAll(functionTasks).ConfigureAwait(false);
+                foreach (var functionTask in functionTasks)
+                {
+                    AddResponseMessage(chatOptions, chat, functionTask.Result.Result, functionTask.Result.ErrorMessage, functionTask.Result.ToolCall, this.Logger);
+                    if (functionTask.Result.Terminate)
+                    {
+                        this.Logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return [chat.Last()];
+                    }
                 }
             }
 
@@ -766,6 +786,10 @@ internal abstract class ClientCore
             chat.Add(chatMessageContent);
 
             // Respond to each tooling request.
+            bool concurrentInvocation = true; // TODO: Make configurable via FunctionChoiceBehavior.
+            var functionTasks = concurrentInvocation && toolCalls.Length > 1 ?
+                new List<Task<(string? Result, string? ErrorMessage, ChatCompletionsToolCall ToolCall, bool Terminate)>>(toolCalls.Length) :
+                null;
             for (int toolCallIndex = 0; toolCallIndex < toolCalls.Length; toolCallIndex++)
             {
                 ChatCompletionsFunctionToolCall toolCall = toolCalls[toolCallIndex];
@@ -807,8 +831,7 @@ internal abstract class ClientCore
                 }
 
                 // Now, invoke the function, and add the resulting tool call message to the chat options.
-                FunctionResult functionResult = new(function) { Culture = kernel.Culture };
-                AutoFunctionInvocationContext invocationContext = new(kernel, function, functionResult, chat, chatMessageContent)
+                AutoFunctionInvocationContext invocationContext = new(kernel, function, new(function) { Culture = kernel.Culture }, chat, chatMessageContent)
                 {
                     ToolCallId = toolCall.Id,
                     Arguments = functionArgs,
@@ -818,55 +841,73 @@ internal abstract class ClientCore
                     CancellationToken = cancellationToken
                 };
 
-                s_inflightAutoInvokes.Value++;
-                try
+                var functionTask = Task.Run<(string? Result, string? ErrorMessage, ChatCompletionsToolCall ToolCall, bool Terminate)>(async () =>
                 {
-                    invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
+                    s_inflightAutoInvokes.Value++; // doesn't need to be decremented explicitly, it'll be reverted as part of the Task unwinding ExecutionContext
+                    try
                     {
-                        // Check if filter requested termination.
-                        if (context.Terminate)
+                        invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
                         {
-                            return;
-                        }
+                            // Check if filter requested termination.
+                            if (context.Terminate)
+                            {
+                                return;
+                            }
 
-                        // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
-                        // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
-                        // as the called function could in turn telling the model about itself as a possible candidate for invocation.
-                        context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    }).ConfigureAwait(false);
-                }
+                            // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
+                            // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
+                            // as the called function could in turn telling the model about itself as a possible candidate for invocation.
+                            context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }).ConfigureAwait(false);
+                    }
 #pragma warning disable CA1031 // Do not catch general exception types
-                catch (Exception e)
-#pragma warning restore CA1031 // Do not catch general exception types
-                {
-                    AddResponseMessage(chatOptions, chat, result: null, $"Error: Exception while invoking function. {e.Message}", toolCall, this.Logger);
-                    continue;
-                }
-                finally
-                {
-                    s_inflightAutoInvokes.Value--;
-                }
-
-                // Apply any changes from the auto function invocation filters context to final result.
-                functionResult = invocationContext.Result;
-
-                object functionResultValue = functionResult.GetValue<object>() ?? string.Empty;
-                var stringResult = ProcessFunctionResult(functionResultValue, chatExecutionSettings.ToolCallBehavior);
-
-                AddResponseMessage(chatOptions, chat, stringResult, errorMessage: null, toolCall, this.Logger);
-
-                // If filter requested termination, returning latest function result and breaking request iteration loop.
-                if (invocationContext.Terminate)
-                {
-                    if (this.Logger.IsEnabled(LogLevel.Debug))
+                    catch (Exception e)
+#pragma warning restore CA1031
                     {
-                        this.Logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return (null, $"Error: Exception while invoking function. {e.Message}", toolCall, invocationContext.Terminate);
                     }
 
-                    var lastChatMessage = chat.Last();
+                    // Apply any changes from the auto function invocation filters context to final result.
+                    var stringResult = ProcessFunctionResult(invocationContext.Result.GetValue<object>() ?? string.Empty, chatExecutionSettings.ToolCallBehavior);
 
-                    yield return new OpenAIStreamingChatMessageContent(lastChatMessage.Role, lastChatMessage.Content);
-                    yield break;
+                    return (stringResult, null, toolCall, invocationContext.Terminate);
+                }, cancellationToken);
+
+                // If concurrent invocation is enabled, add the task to the list for later waiting. Otherwise, join with it now.
+                if (functionTasks is not null)
+                {
+                    functionTasks.Add(functionTask);
+                }
+                else
+                {
+                    var functionResult = await functionTask.ConfigureAwait(false);
+                    AddResponseMessage(chatOptions, chat, functionResult.Result, functionResult.ErrorMessage, functionResult.ToolCall, this.Logger);
+                    if (functionResult.Terminate)
+                    {
+                        this.Logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        var lastChatMessage = chat.Last();
+                        yield return new OpenAIStreamingChatMessageContent(lastChatMessage.Role, lastChatMessage.Content);
+                        yield break;
+                    }
+                }
+            }
+
+            // If concurrent invocation is enabled, join with all the tasks now.
+            if (functionTasks is not null)
+            {
+                // Wait for all of the function invocations to complete, then add the results to the chat, but stop when we hit a
+                // function for which termination was requested.
+                await Task.WhenAll(functionTasks).ConfigureAwait(false);
+                foreach (var functionTask in functionTasks)
+                {
+                    AddResponseMessage(chatOptions, chat, functionTask.Result.Result, functionTask.Result.ErrorMessage, functionTask.Result.ToolCall, this.Logger);
+                    if (functionTask.Result.Terminate)
+                    {
+                        this.Logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        var lastChatMessage = chat.Last();
+                        yield return new OpenAIStreamingChatMessageContent(lastChatMessage.Role, lastChatMessage.Content);
+                        yield break;
+                    }
                 }
             }
 

@@ -144,6 +144,10 @@ internal sealed class MistralClient
 
             // We must send back a response for every tool call, regardless of whether we successfully executed it or not.
             // If we successfully execute it, we'll add the result. If we don't, we'll add an error.
+            bool concurrentInvocation = true; // TODO: Make configurable via FunctionChoiceBehavior.
+            var functionTasks = concurrentInvocation && chatChoice.ToolCallCount > 1 ?
+                new List<Task<(string? Result, string? ErrorMessage, MistralToolCall ToolCall, bool Terminate)>>(chatChoice.ToolCallCount) :
+                null;
             for (int toolCallIndex = 0; toolCallIndex < chatChoice.ToolCallCount; toolCallIndex++)
             {
                 var toolCall = chatChoice.ToolCalls![toolCallIndex];
@@ -173,8 +177,7 @@ internal sealed class MistralClient
                 }
 
                 // Now, invoke the function, and add the resulting tool call message to the chat options.
-                FunctionResult functionResult = new(function) { Culture = kernel.Culture };
-                AutoFunctionInvocationContext invocationContext = new(kernel, function, functionResult, chatHistory, chatMessageContent)
+                AutoFunctionInvocationContext invocationContext = new(kernel, function, new(function) { Culture = kernel.Culture }, chatHistory, chatMessageContent)
                 {
                     ToolCallId = toolCall.Id,
                     Arguments = functionArgs,
@@ -183,52 +186,70 @@ internal sealed class MistralClient
                     FunctionCount = chatChoice.ToolCalls.Count,
                     CancellationToken = cancellationToken
                 };
-                s_inflightAutoInvokes.Value++;
-                try
+
+                var functionTask = Task.Run<(string? Result, string? ErrorMessage, MistralToolCall ToolCall, bool Terminate)>(async () =>
                 {
-                    invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
+                    s_inflightAutoInvokes.Value++; // doesn't need to be decremented explicitly, it'll be reverted as part of the Task unwinding ExecutionContext
+                    try
                     {
-                        // Check if filter requested termination.
-                        if (context.Terminate)
+                        invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
                         {
-                            return;
-                        }
+                            // Check if filter requested termination.
+                            if (context.Terminate)
+                            {
+                                return;
+                            }
 
-                        // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
-                        // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
-                        // as the called function could in turn telling the model about itself as a possible candidate for invocation.
-                        context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    }).ConfigureAwait(false);
-                }
+                            // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
+                            // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
+                            // as the called function could in turn telling the model about itself as a possible candidate for invocation.
+                            context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }).ConfigureAwait(false);
+                    }
 #pragma warning disable CA1031 // Do not catch general exception types
-                catch (Exception e)
+                    catch (Exception e)
 #pragma warning restore CA1031
-                {
-                    this.AddResponseMessage(chatRequest, chatHistory, toolCall, result: null, $"Error: Exception while invoking function. {e.Message}");
-                    continue;
-                }
-                finally
-                {
-                    s_inflightAutoInvokes.Value--;
-                }
-
-                // Apply any changes from the auto function invocation filters context to final result.
-                functionResult = invocationContext.Result;
-
-                object functionResultValue = functionResult.GetValue<object>() ?? string.Empty;
-                var stringResult = ProcessFunctionResult(functionResultValue, mistralExecutionSettings.ToolCallBehavior);
-
-                this.AddResponseMessage(chatRequest, chatHistory, toolCall, result: stringResult, errorMessage: null);
-
-                // If filter requested termination, returning latest function result.
-                if (invocationContext.Terminate)
-                {
-                    if (this._logger.IsEnabled(LogLevel.Debug))
                     {
-                        this._logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return (null, $"Error: Exception while invoking function. {e.Message}", toolCall, invocationContext.Terminate);
                     }
 
-                    return [chatHistory.Last()];
+                    // Apply any changes from the auto function invocation filters context to final result.
+                    var stringResult = ProcessFunctionResult(invocationContext.Result.GetValue<object>() ?? string.Empty, mistralExecutionSettings.ToolCallBehavior);
+
+                    return (stringResult, null, toolCall, invocationContext.Terminate);
+                }, cancellationToken);
+
+                // If concurrent invocation is enabled, add the task to the list for later waiting. Otherwise, join with it now.
+                if (functionTasks is not null)
+                {
+                    functionTasks.Add(functionTask);
+                }
+                else
+                {
+                    var functionResult = await functionTask.ConfigureAwait(false);
+                    this.AddResponseMessage(chatRequest, chatHistory, functionResult.ToolCall, functionResult.Result, functionResult.ErrorMessage);
+                    if (functionResult.Terminate)
+                    {
+                        this._logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return [chatHistory.Last()];
+                    }
+                }
+            }
+
+            // If concurrent invocation is enabled, join with all the tasks now.
+            if (functionTasks is not null)
+            {
+                // Wait for all of the function invocations to complete, then add the results to the chat, but stop when we hit a
+                // function for which termination was requested.
+                await Task.WhenAll(functionTasks).ConfigureAwait(false);
+                foreach (var functionTask in functionTasks)
+                {
+                    this.AddResponseMessage(chatRequest, chatHistory, functionTask.Result.ToolCall, functionTask.Result.Result, functionTask.Result.ErrorMessage);
+                    if (functionTask.Result.Terminate)
+                    {
+                        this._logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return [chatHistory.Last()];
+                    }
                 }
             }
 
@@ -376,7 +397,10 @@ internal sealed class MistralClient
             // We must send back a response for every tool call, regardless of whether we successfully executed it or not.
             // If we successfully execute it, we'll add the result. If we don't, we'll add an error.
             // TODO Check are we missing code here?
-
+            bool concurrentInvocation = true; // TODO: Make configurable via FunctionChoiceBehavior.
+            var functionTasks = concurrentInvocation && toolCalls.Count > 1 ?
+                new List<Task<(string? Result, string? ErrorMessage, MistralToolCall ToolCall, bool Terminate)>>(toolCalls.Count) :
+                null;
             for (int toolCallIndex = 0; toolCallIndex < toolCalls.Count; toolCallIndex++)
             {
                 var toolCall = toolCalls[toolCallIndex];
@@ -406,8 +430,7 @@ internal sealed class MistralClient
                 }
 
                 // Now, invoke the function, and add the resulting tool call message to the chat options.
-                FunctionResult functionResult = new(function) { Culture = kernel.Culture };
-                AutoFunctionInvocationContext invocationContext = new(kernel, function, functionResult, chatHistory, chatHistory.Last())
+                AutoFunctionInvocationContext invocationContext = new(kernel, function, new(function) { Culture = kernel.Culture }, chatHistory, chatHistory.Last())
                 {
                     ToolCallId = toolCall.Id,
                     Arguments = functionArgs,
@@ -416,55 +439,74 @@ internal sealed class MistralClient
                     FunctionCount = toolCalls.Count,
                     CancellationToken = cancellationToken
                 };
-                s_inflightAutoInvokes.Value++;
-                try
+
+                var functionTask = Task.Run<(string? Result, string? ErrorMessage, MistralToolCall ToolCall, bool Terminate)>(async () =>
                 {
-                    invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
+                    s_inflightAutoInvokes.Value++; // doesn't need to be decremented explicitly, it'll be reverted as part of the Task unwinding ExecutionContext
+                    try
                     {
-                        // Check if filter requested termination.
-                        if (context.Terminate)
+                        invocationContext = await OnAutoFunctionInvocationAsync(kernel, invocationContext, async (context) =>
                         {
-                            return;
-                        }
+                            // Check if filter requested termination.
+                            if (context.Terminate)
+                            {
+                                return;
+                            }
 
-                        // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
-                        // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
-                        // as the called function could in turn telling the model about itself as a possible candidate for invocation.
-                        context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    }).ConfigureAwait(false);
-                }
+                            // Note that we explicitly do not use executionSettings here; those pertain to the all-up operation and not necessarily to any
+                            // further calls made as part of this function invocation. In particular, we must not use function calling settings naively here,
+                            // as the called function could in turn telling the model about itself as a possible candidate for invocation.
+                            context.Result = await function.InvokeAsync(kernel, invocationContext.Arguments, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }).ConfigureAwait(false);
+                    }
 #pragma warning disable CA1031 // Do not catch general exception types
-                catch (Exception e)
+                    catch (Exception e)
 #pragma warning restore CA1031
-                {
-                    this.AddResponseMessage(chatRequest, chatHistory, toolCall, result: null, $"Error: Exception while invoking function. {e.Message}");
-                    continue;
-                }
-                finally
-                {
-                    s_inflightAutoInvokes.Value--;
-                }
-
-                // Apply any changes from the auto function invocation filters context to final result.
-                functionResult = invocationContext.Result;
-
-                object functionResultValue = functionResult.GetValue<object>() ?? string.Empty;
-                var stringResult = ProcessFunctionResult(functionResultValue, mistralExecutionSettings.ToolCallBehavior);
-
-                this.AddResponseMessage(chatRequest, chatHistory, toolCall, result: stringResult, errorMessage: null);
-
-                // If filter requested termination, returning latest function result and breaking request iteration loop.
-                if (invocationContext.Terminate)
-                {
-                    if (this._logger.IsEnabled(LogLevel.Debug))
                     {
-                        this._logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        return (null, $"Error: Exception while invoking function. {e.Message}", toolCall, invocationContext.Terminate);
                     }
 
-                    var lastChatMessage = chatHistory.Last();
+                    // Apply any changes from the auto function invocation filters context to final result.
+                    var stringResult = ProcessFunctionResult(invocationContext.Result.GetValue<object>() ?? string.Empty, mistralExecutionSettings.ToolCallBehavior);
 
-                    yield return new StreamingChatMessageContent(lastChatMessage.Role, lastChatMessage.Content);
-                    yield break;
+                    return (stringResult, null, toolCall, invocationContext.Terminate);
+                }, cancellationToken);
+
+                // If concurrent invocation is enabled, add the task to the list for later waiting. Otherwise, join with it now.
+                if (functionTasks is not null)
+                {
+                    functionTasks.Add(functionTask);
+                }
+                else
+                {
+                    var functionResult = await functionTask.ConfigureAwait(false);
+                    this.AddResponseMessage(chatRequest, chatHistory, functionResult.ToolCall, functionResult.Result, functionResult.ErrorMessage);
+                    if (functionResult.Terminate)
+                    {
+                        this._logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        var lastChatMessage = chatHistory.Last();
+                        yield return new StreamingChatMessageContent(lastChatMessage.Role, lastChatMessage.Content);
+                        yield break;
+                    }
+                }
+            }
+
+            // If concurrent invocation is enabled, join with all the tasks now.
+            if (functionTasks is not null)
+            {
+                // Wait for all of the function invocations to complete, then add the results to the chat, but stop when we hit a
+                // function for which termination was requested.
+                await Task.WhenAll(functionTasks).ConfigureAwait(false);
+                foreach (var functionTask in functionTasks)
+                {
+                    this.AddResponseMessage(chatRequest, chatHistory, functionTask.Result.ToolCall, functionTask.Result.Result, functionTask.Result.ErrorMessage);
+                    if (functionTask.Result.Terminate)
+                    {
+                        this._logger.LogDebug("Filter requested termination of automatic function invocation.");
+                        var lastChatMessage = chatHistory.Last();
+                        yield return new StreamingChatMessageContent(lastChatMessage.Role, lastChatMessage.Content);
+                        yield break;
+                    }
                 }
             }
 
