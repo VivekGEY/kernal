@@ -55,6 +55,7 @@
         "huggingface",
         "pytestmark",
         "contoso",
-        "opentelemetry"
+        "opentelemetry",
+        "vectorizable"
     ]
 }
