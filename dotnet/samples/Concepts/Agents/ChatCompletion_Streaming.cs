@@ -1,6 +1,5 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 using System.ComponentModel;
-using System.Text;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
 using Microsoft.SemanticKernel.ChatCompletion;
@@ -12,7 +11,7 @@ namespace Agents;
 /// Demonstrate creation of <see cref="ChatCompletionAgent"/> and
 /// eliciting its response to three explicit user messages.
 /// </summary>
-public class ChatCompletion_Streaming(ITestOutputHelper output) : BaseTest(output)
+public class ChatCompletion_Streaming(ITestOutputHelper output) : BaseAgentsTest(output)
 {
     private const string ParrotName = "Parrot";
     private const string ParrotInstructions = "Repeat the user message in the voice of a pirate and then end with a parrot sound.";
@@ -66,32 +65,35 @@ public class ChatCompletion_Streaming(ITestOutputHelper output) : BaseTest(outpu
     // Local function to invoke agent and display the conversation messages.
     private async Task InvokeAgentAsync(ChatCompletionAgent agent, ChatHistory chat, string input)
     {
-        chat.Add(new ChatMessageContent(AuthorRole.User, input));
+        ChatMessageContent message = new(AuthorRole.User, input);
+        chat.Add(message);
+        this.WriteAgentChatMessage(message);
 
-        Console.WriteLine($"# {AuthorRole.User}: '{input}'");
+        int historyCount = chat.Count;
 
-        StringBuilder builder = new();
-        await foreach (StreamingChatMessageContent message in agent.InvokeStreamingAsync(chat))
+        bool isFirst = false;
+        await foreach (StreamingChatMessageContent response in agent.InvokeStreamingAsync(chat))
         {
-            if (string.IsNullOrEmpty(message.Content))
+            if (string.IsNullOrEmpty(response.Content))
             {
                 continue;
             }
 
-            if (builder.Length == 0)
+            if (!isFirst)
             {
-                Console.WriteLine($"# {message.Role} - {message.AuthorName ?? "*"}:");
+                Console.WriteLine($"\n# {response.Role} - {response.AuthorName ?? "*"}:");
+                isFirst = true;
             }
 
-            Console.WriteLine($"\t > streamed: '{message.Content}'");
-            builder.Append(message.Content);
+            Console.WriteLine($"\t > streamed: '{response.Content}'");
         }
 
-        if (builder.Length > 0)
+        if (historyCount <= chat.Count)
         {
-            // Display full response and capture in chat history
-            Console.WriteLine($"\t > complete: '{builder}'");
-            chat.Add(new ChatMessageContent(AuthorRole.Assistant, builder.ToString()) { AuthorName = agent.Name });
+            for (int index = historyCount; index < chat.Count; index++)
+            {
+                this.WriteAgentChatMessage(chat[index]);
+            }
         }
     }
 
