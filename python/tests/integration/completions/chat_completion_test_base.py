@@ -65,6 +65,27 @@ try:
         ollama_setup = True
 except KeyError:
     ollama_setup = False
+    
+google_ai_setup: bool = False
+try:
+    if os.environ["GOOGLE_AI_API_KEY"]:
+        google_ai_setup = True
+except KeyError:
+    google_ai_setup = False
+    
+vertex_ai_setup: bool = False
+try:
+    if os.environ["VERTEX_AI_SERVICE_ACCOUNT_KEY"]:
+        vertex_ai_setup = True
+except KeyError:
+    vertex_ai_setup = False
+    
+anthropic_setup: bool = False
+try:
+    if os.environ["ANTHROPIC_API_KEY"] and os.environ["ANTHROPIC_CHAT_MODEL_ID"]:
+        anthropic_setup = True
+except KeyError:
+    anthropic_setup = False
 
 
 class ChatCompletionTestBase(CompletionTestBase):
@@ -106,8 +127,8 @@ class ChatCompletionTestBase(CompletionTestBase):
                 MistralAIChatPromptExecutionSettings,
             ),
             "ollama": (OllamaChatCompletion() if ollama_setup else None, OllamaChatPromptExecutionSettings),
-            "google_ai": (GoogleAIChatCompletion(), GoogleAIChatPromptExecutionSettings),
-            "vertex_ai": (VertexAIChatCompletion(), VertexAIChatPromptExecutionSettings),
+            "google_ai": (GoogleAIChatCompletion() if google_ai_setup else None, GoogleAIChatPromptExecutionSettings),
+            "vertex_ai": (VertexAIChatCompletion() if vertex_ai_setup else None, VertexAIChatPromptExecutionSettings),
         }
 
     def setup(self, kernel: Kernel):
