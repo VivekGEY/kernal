@@ -14,12 +14,13 @@ using SemanticKernel.IntegrationTests.TestSettings;
 using Xunit;
 using Xunit.Abstractions;
 
-namespace SemanticKernel.IntegrationTests.Agents.OpenAI;
+namespace SemanticKernel.IntegrationTests.Agents;
 
 #pragma warning disable xUnit1004 // Contains test methods used in manual verification. Disable warning for this file only.
 
 public sealed class OpenAIAssistantAgentTests(ITestOutputHelper output) : IDisposable
 {
+    private const string AssistantModel = "gpt-4o"; // Model must be able to support assistant API
     private readonly IKernelBuilder _kernelBuilder = Kernel.CreateBuilder();
     private readonly IConfigurationRoot _configuration = new ConfigurationBuilder()
             .AddJsonFile(path: "testsettings.json", optional: false, reloadOnChange: true)
@@ -36,12 +37,12 @@ public sealed class OpenAIAssistantAgentTests(ITestOutputHelper output) : IDispo
     [InlineData("What is the special soup?", "Clam Chowder")]
     public async Task OpenAIAssistantAgentTestAsync(string input, string expectedAnswerContains)
     {
-        var openAIConfiguration = this._configuration.GetSection("OpenAI").Get<OpenAIConfiguration>();
+        OpenAIConfiguration openAIConfiguration = this._configuration.GetSection("OpenAI").Get<OpenAIConfiguration>()!;
         Assert.NotNull(openAIConfiguration);
 
         await this.ExecuteAgentAsync(
             new(openAIConfiguration.ApiKey),
-            openAIConfiguration.ModelId,
+            AssistantModel,
             input,
             expectedAnswerContains);
     }
@@ -50,7 +51,7 @@ public sealed class OpenAIAssistantAgentTests(ITestOutputHelper output) : IDispo
     /// Integration test for <see cref="OpenAIAssistantAgent"/> using function calling
     /// and targeting Azure OpenAI services.
     /// </summary>
-    [Theory(Skip = "No supported endpoint configured.")]
+    [Theory]
     [InlineData("What is the special soup?", "Clam Chowder")]
     public async Task AzureOpenAIAssistantAgentAsync(string input, string expectedAnswerContains)
     {
@@ -59,7 +60,7 @@ public sealed class OpenAIAssistantAgentTests(ITestOutputHelper output) : IDispo
 
         await this.ExecuteAgentAsync(
             new(azureOpenAIConfiguration.ApiKey, azureOpenAIConfiguration.Endpoint),
-            azureOpenAIConfiguration.ChatDeploymentName!,
+            AssistantModel,
             input,
             expectedAnswerContains);
     }
@@ -88,18 +89,25 @@ public sealed class OpenAIAssistantAgentTests(ITestOutputHelper output) : IDispo
                     ModelId = modelName,
                 });
 
-        AgentGroupChat chat = new();
-        chat.AddChatMessage(new ChatMessageContent(AuthorRole.User, input));
-
-        // Act
-        StringBuilder builder = new();
-        await foreach (var message in chat.InvokeAsync(agent))
+        try
         {
-            builder.Append(message.Content);
-        }
+            AgentGroupChat chat = new();
+            chat.AddChatMessage(new ChatMessageContent(AuthorRole.User, input));
 
-        // Assert
-        Assert.Contains(expected, builder.ToString(), StringComparison.OrdinalIgnoreCase);
+            // Act
+            StringBuilder builder = new();
+            await foreach (var message in chat.InvokeAsync(agent))
+            {
+                builder.Append(message.Content);
+            }
+
+            // Assert
+            Assert.Contains(expected, builder.ToString(), StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            await agent.DeleteAsync();
+        }
     }
 
     private readonly XunitLogger<Kernel> _logger = new(output);
