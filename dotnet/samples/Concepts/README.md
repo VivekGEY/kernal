@@ -155,6 +155,10 @@ Down below you can find the code snippets that demonstrate the usage of many Sem
 - [MyAzureAISearchPlugin](https://github.com/microsoft/semantic-kernel/blob/main/dotnet/samples/Concepts/Search/MyAzureAISearchPlugin.cs)
 - [WebSearchQueriesPlugin](https://github.com/microsoft/semantic-kernel/blob/main/dotnet/samples/Concepts/Search/WebSearchQueriesPlugin.cs)
 
+- ## Telemetry - Examples showing how to enable telemetry for the Semantic Kernel
+
+- [AzureOpenAI_FunctionCallingTelemetry](https://github.com/microsoft/semantic-kernel/blob/main/dotnet/samples/Concepts/Telemetry/AzureOpenAI_FunctionCallingTelemetry.cs)
+
 ## TextGeneration - [`TextGeneration`](https://github.com/microsoft/semantic-kernel/blob/main/dotnet/src/SemanticKernel.Abstractions/AI/TextGeneration/ITextGenerationService.cs) capable service with models
 
 - [Custom_TextGenerationService](https://github.com/microsoft/semantic-kernel/blob/main/dotnet/samples/Concepts/TextGeneration/Custom_TextGenerationService.cs)
